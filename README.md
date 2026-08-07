@@ -61,7 +61,11 @@ then exists only while a disruption is happening.
 Measured on EKS with Karpenter on arm64 spot nodes, one replica behind an
 application load balancer, with no spare capacity so every replacement waited
 for a new EC2 instance. The availability probe ran at roughly three requests
-per second.
+per second. The disruption results below are from the v0.3.x PDB mechanism;
+v0.4.0 separately validated the admission path on the same staging cluster:
+same-node stand-ins remained held, a clear-node stand-in released immediately,
+the 10-second TTL released in 12 seconds, and operator-down fail-open admitted
+in 423 ms.
 
 | Event | Failed requests |
 |---|---|
@@ -95,8 +99,7 @@ understudies` shows the target, the mode, the phase, and how long anything has
 been blocked.
 
 The footprint of the default install is one Deployment with one replica. The
-webhook is served from that same pod, and a small CronJob acts as a dead man's
-switch for the operator's own budgets. There is no DaemonSet and no per-node
+webhook is served from that same pod. There is no DaemonSet and no per-node
 agent. Drains, Karpenter disruption, autoscaler scale-downs and node upgrades
 are all detected from the API server by the operator pod alone, and on
 Karpenter clusters that includes spot interruptions, because Karpenter reacts
@@ -152,10 +155,11 @@ against a deadline it cannot see.
 
 ## How it works
 
-Briefly: a PodDisruptionBudget sized to block every eviction, a surge when a
-node is reported doomed, a release once the replacement passes its readiness
-gates, and a scale-back that removes the right pod. The full explanation, with
-diagrams and the reasoning behind each decision, is in
+Briefly: answer the eviction at the door with HTTP 429, surge when its node is
+reported doomed, admit a retry once the replacement passes its readiness
+gates, and scale back by removing the right pod. No PodDisruptionBudget is
+created. The full explanation, with diagrams and the reasoning behind each
+decision, is in
 [docs/how-it-works.md](docs/how-it-works.md).
 
 Signals reach the operator through four adapters, and the core contains no
@@ -173,60 +177,29 @@ provider-specific code:
 Alert on `understudy_oldest_blocked_eviction_seconds`. It exists so that a held
 eviction is always visible and bounded.
 
-If a surge cannot make progress, the budget is relaxed rather than stalling the
-drain forever. If the operator itself disappears, a CronJob removes the budgets
-it left behind and the cluster returns to plain Kubernetes behaviour. There is
-a manual version of the same thing:
+If a surge cannot make progress, the hold is relaxed rather than stalling the
+drain forever. The webhook is fail-open: if every operator replica is
+unavailable, Kubernetes admits evictions normally within the webhook timeout.
+To disable holds immediately:
 
 ```sh
-kubectl delete pdb -A -l understudy.sh/owned=true
+kubectl delete validatingwebhookconfiguration understudy-eviction-hold
 ```
 
 The operator refuses to manage itself, skips targets it cannot help, and stands
 down while a rollout is in progress.
 
+For production, use `replicaCount: 2` and place the replicas on different
+nodes. The webhook serves from every replica even though reconciliation is
+leader-gated. If the node hosting the only operator pod is drained, its own
+eviction is admitted and protection for pods later in that drain can disappear.
+
 ## Limits and the tradeoff
 
-Understudy reacts to disruptions; it never starts one. That line is the
-design, and most of what follows falls out of it.
-
-**A protected workload can pin its node.** This is the one to understand
-before protecting anything. Modern node orchestrators check budgets before
-they act: Karpenter dry-runs PodDisruptionBudgets for consolidation, drift
-and expiry alike, and simply never begins while the hostage budget allows no
-disruptions. No cordon, no taint, no eviction attempt, so there is nothing
-for any fail-safe to catch and nothing for Understudy to react to.
-Bin-packing skips the node, and on clusters where nothing forces the issue,
-so does node recycling.
-
-Understudy makes that visible rather than resolving it behind your back.
-When a blocker reports that an owned budget stopped it, the affected
-Understudy gets a `NodePinned` condition, a Warning event, and the
-`understudy_node_pinned_total` counter moves. What to do about it is your
-call, in rough order of preference:
-
-- Let deploys do it: every rollout reschedules the workload, and the pin
-  ends wherever the new pod lands. On anything that ships regularly this is
-  the whole answer.
-- `kubectl rollout restart` is the manual version of the same thing when a
-  `NodePinned` condition bothers you.
-- Delete the node claim itself. Deleting it starts a drain instead of
-  asking permission for one, so the taint appears, Understudy surges, and
-  the handover happens normally with no downtime. Pair it with a NodePool
-  `terminationGracePeriod` so that drain is bounded: budgets are still
-  honoured, but a replacement that never becomes ready cannot hold the node
-  open forever.
-- `hostageMode: voluntary-only` or `off` trades protection for mobility on
-  workloads where bin-packing matters more than the last second of uptime.
-
-`terminationGracePeriod` on its own does not lift the pin, which is worth
-saying plainly because it reads like it should. Measured on Karpenter 1.12:
-a node whose claim carries the field is still refused with `Pdb prevents
-pod evictions` while it is merely a disruption candidate. The field bounds
-a drain that has started. It does not start one.
-
-What Understudy will not do is move a healthy pod on its own initiative. A
-tool that guards availability should never be the reason a pod died.
+Understudy reacts to disruptions; it never starts one. Because there is no
+budget for a disrupter to pre-check, consolidation, drift and expiry can select
+the node normally. The disrupter begins, retries the admission hold while the
+stand-in starts, and proceeds as soon as the stand-in is ready.
 
 **In-flight requests are not saved.** Understudy guarantees a ready
 replacement, not the requests already travelling to the departing pod. Give

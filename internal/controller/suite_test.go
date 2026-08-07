@@ -42,7 +42,6 @@ import (
 	"github.com/kylan11/understudy/internal/signal"
 	"github.com/kylan11/understudy/internal/signal/cordon"
 	"github.com/kylan11/understudy/internal/signal/evictionwebhook"
-	"github.com/kylan11/understudy/internal/signal/pinned"
 	"github.com/kylan11/understudy/internal/signal/taint"
 	// +kubebuilder:scaffold:imports
 )
@@ -113,11 +112,10 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	registry = signal.NewRegistry()
-	registry.StartJanitor(ctx, time.Second)
+	registry.StartExpiryLoop(ctx, time.Second)
 	Expect(cordon.New().SetupWithManager(mgr, registry)).To(Succeed())
 	Expect(taint.New(nil).SetupWithManager(mgr, registry)).To(Succeed())
 	Expect((&evictionwebhook.Adapter{DoomLifetime: 5 * time.Second}).SetupWithManager(mgr, registry)).To(Succeed())
-	Expect((&pinned.Watcher{StaleAfter: 5 * time.Second}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&UnderstudyReconciler{
 		Client:             mgr.GetClient(),
 		Scheme:             mgr.GetScheme(),
@@ -152,9 +150,9 @@ func evictionWebhookConfig() *admissionv1.ValidatingWebhookConfiguration {
 	scope := admissionv1.NamespacedScope
 	path := evictionwebhook.Path
 	return &admissionv1.ValidatingWebhookConfiguration{
-		ObjectMeta: metav1.ObjectMeta{Name: "understudy-eviction-observer"},
+		ObjectMeta: metav1.ObjectMeta{Name: "understudy-eviction-hold"},
 		Webhooks: []admissionv1.ValidatingWebhook{{
-			Name:                    "eviction-observer.understudy.sh",
+			Name:                    "eviction-hold.understudy.sh",
 			FailurePolicy:           &failurePolicy,
 			SideEffects:             &sideEffects,
 			AdmissionReviewVersions: []string{"v1"},

@@ -184,22 +184,6 @@ func taintNode(node *corev1.Node, key string) {
 	}).Should(Succeed())
 }
 
-func emitBlockedEvent(node, pdbRef string) {
-	ev := &corev1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      node + ".consolidation-blocked",
-			Namespace: metav1.NamespaceDefault,
-		},
-		InvolvedObject: corev1.ObjectReference{Kind: "Node", Name: node},
-		Reason:         "DisruptionBlocked",
-		Type:           corev1.EventTypeNormal,
-		Message:        fmt.Sprintf("Cannot disrupt Node: pdb %q prevents pod evictions", pdbRef),
-		Source:         corev1.EventSource{Component: "karpenter"},
-		LastTimestamp:  metav1.Now(),
-	}
-	ExpectWithOffset(1, k8sClient.Create(ctx, ev)).To(Succeed())
-}
-
 func getDeployment(f *fixture) *appsv1.Deployment {
 	dep := &appsv1.Deployment{}
 	ExpectWithOffset(1, k8sClient.Get(ctx, client.ObjectKeyFromObject(f.dep), dep)).To(Succeed())
@@ -212,10 +196,9 @@ func getCR(f *fixture) *appsv1alpha1.Understudy {
 	return cr
 }
 
-func getPDB(f *fixture) (*policyv1.PodDisruptionBudget, error) {
+func getPDB(f *fixture) error {
 	pdb := &policyv1.PodDisruptionBudget{}
-	err := k8sClient.Get(ctx, types.NamespacedName{Namespace: f.ns, Name: "understudy-" + f.cr.Name}, pdb)
-	return pdb, err
+	return k8sClient.Get(ctx, types.NamespacedName{Namespace: f.ns, Name: "understudy-" + f.cr.Name}, pdb)
 }
 
 func expectSurged(f *fixture) {
@@ -238,20 +221,43 @@ func expectSurged(f *fixture) {
 
 var _ = Describe("Understudy controller", func() {
 
-	It("creates the hostage PDB and stays Idle on a healthy node", func() {
+	It("deletes legacy owned budgets and preserves unrelated budgets", func() {
+		f := newFixture(nil)
+		owned := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "legacy-owned",
+				Namespace: f.ns,
+				Labels:    map[string]string{LabelOwned: "true"},
+			},
+		}
+		unowned := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{Name: "unowned", Namespace: f.ns},
+		}
+		Expect(k8sClient.Create(ctx, owned)).To(Succeed())
+		Expect(k8sClient.Create(ctx, unowned)).To(Succeed())
+
+		Expect(sweepOwnedPDBs(ctx, k8sClient, k8sClient)).To(Succeed())
+		Eventually(func() bool {
+			err := k8sClient.Get(ctx, client.ObjectKeyFromObject(owned), &policyv1.PodDisruptionBudget{})
+			return apierrors.IsNotFound(err)
+		}).Should(BeTrue())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(unowned), &policyv1.PodDisruptionBudget{})).To(Succeed())
+	})
+
+	It("owns no objects and stays Idle on a healthy node", func() {
 		f := newFixture(nil)
 
-		By("owning a blocking PDB with minAvailable = base replicas")
-		Eventually(func() (int, error) {
-			pdb, err := getPDB(f)
-			if err != nil {
-				return -1, err
-			}
-			return pdb.Spec.MinAvailable.IntValue(), nil
-		}).Should(Equal(1))
+		By("owning no PodDisruptionBudget")
+		Consistently(func() bool {
+			return apierrors.IsNotFound(getPDB(f))
+		}).Should(BeTrue())
 
 		By("reporting Idle and never touching replicas")
 		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseIdle))
+		Expect(findCond(getCR(f), appsv1alpha1.ConditionProtected)).To(And(
+			HaveField("Status", metav1.ConditionTrue),
+			HaveField("Reason", "EvictionHold"),
+		))
 		Consistently(func() int32 { return *getDeployment(f).Spec.Replicas }).Should(Equal(int32(1)))
 		Expect(getDeployment(f).Annotations).NotTo(HaveKey(AnnotationBaseReplicas))
 	})
@@ -276,39 +282,6 @@ var _ = Describe("Understudy controller", func() {
 			expectSurged(f)
 		})
 	}
-
-	It("reports a pinned node without acting on it", func() {
-		f := newFixture(nil)
-		Eventually(func() error {
-			_, err := getPDB(f)
-			return err
-		}).Should(Succeed())
-
-		emitBlockedEvent(f.node.Name, f.ns+"/understudy-"+f.cr.Name)
-
-		By("raising the NodePinned condition")
-		Eventually(func() metav1.ConditionStatus {
-			if c := findCond(getCR(f), appsv1alpha1.ConditionNodePinned); c != nil {
-				return c.Status
-			}
-			return metav1.ConditionUnknown
-		}).Should(Equal(metav1.ConditionTrue))
-
-		By("touching nothing: no surge, no annotations, the budget keeps blocking")
-		Consistently(func() int32 { return *getDeployment(f).Spec.Replicas }).Should(Equal(int32(1)))
-		Expect(getDeployment(f).Annotations).NotTo(HaveKey(AnnotationBaseReplicas))
-		pdb, err := getPDB(f)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(pdb.Spec.MinAvailable.IntValue()).To(Equal(1))
-
-		By("clearing the condition once the refusals go stale")
-		Eventually(func() metav1.ConditionStatus {
-			if c := findCond(getCR(f), appsv1alpha1.ConditionNodePinned); c != nil {
-				return c.Status
-			}
-			return metav1.ConditionUnknown
-		}, 30*time.Second).Should(Equal(metav1.ConditionFalse))
-	})
 
 	It("does not surge on unrelated taints or healthy nodes", func() {
 		f := newFixture(nil)
@@ -390,25 +363,15 @@ var _ = Describe("Understudy controller", func() {
 		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseIdle))
 	})
 
-	It("fires the never-wedge TTL: a stuck surge relaxes the PDB instead of wedging the drain", func() {
+	It("fires the never-wedge TTL and admits the eviction", func() {
 		f := newFixture(func(cr *appsv1alpha1.Understudy) {
 			cr.Spec.ReadinessDeadlineSeconds = ptr.To(int32(1))
 		})
 		cordonNode(f.node)
 		expectSurged(f)
 
-		By("relaxing the PDB after the readiness deadline")
-		Eventually(func() (int, error) {
-			pdb, err := getPDB(f)
-			if err != nil {
-				return -1, err
-			}
-			return pdb.Spec.MinAvailable.IntValue(), nil
-		}).Should(Equal(0), "PDB should be relaxed to minAvailable=0")
-		pdb, err := getPDB(f)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(pdb.Annotations).To(HaveKeyWithValue(AnnotationRelaxed, relaxReasonTTL))
 		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseRelaxed))
+		Eventually(func() error { return evict(f.pod, false) }).Should(Succeed())
 	})
 
 	It("releases immediately when an involuntary deadline is shorter than minSurgeTimeSeconds", func() {
@@ -426,19 +389,14 @@ var _ = Describe("Understudy controller", func() {
 		})
 		DeferCleanup(func() { registry.Clear(f.node.Name, "test:injected-itn") })
 
-		By("relaxing the PDB at once; holding a hostage cannot help below minSurgeTime")
-		Eventually(func() (int, error) {
-			pdb, err := getPDB(f)
-			if err != nil {
-				return -1, err
-			}
-			return pdb.Spec.MinAvailable.IntValue(), nil
-		}).Should(Equal(0))
-		pdb, _ := getPDB(f)
-		Expect(pdb.Annotations).To(HaveKeyWithValue(AnnotationRelaxed, relaxReasonDeadline))
+		By("relaxing the hold at once because waiting cannot help below minSurgeTime")
+		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseRelaxed))
 
 		By("still surging in parallel to minimize the gap")
 		expectSurged(f)
+
+		By("admitting the eviction")
+		Eventually(func() error { return evict(f.pod, false) }).Should(Succeed())
 	})
 
 	It("skips unsupported target kinds with a condition, never error-looping", func() {
@@ -457,8 +415,7 @@ var _ = Describe("Understudy controller", func() {
 			cr.Spec.HostageMode = appsv1alpha1.HostageOff
 		})
 		Consistently(func() bool {
-			_, err := getPDB(f)
-			return apierrors.IsNotFound(err)
+			return apierrors.IsNotFound(getPDB(f))
 		}).Should(BeTrue(), "no PDB may exist in hostageMode=off")
 
 		cordonNode(f.node)

@@ -54,6 +54,11 @@ type Adapter struct {
 	registry *signal.Registry
 }
 
+type protector struct {
+	cr  *appsv1alpha1.Understudy
+	dep *appsv1.Deployment
+}
+
 func New() *Adapter { return &Adapter{} }
 
 func (a *Adapter) lifetime() time.Duration {
@@ -88,10 +93,13 @@ func (a *Adapter) Handle(ctx context.Context, req admission.Request) admission.R
 	if pod.Spec.NodeName == "" {
 		return allowed
 	}
+	if pod.DeletionTimestamp != nil {
+		return allowed
+	}
 
-	cr, dep, protected := a.resolveProtector(ctx, &pod)
-	metrics.EvictionAttemptsObserved.WithLabelValues(strconv.FormatBool(protected)).Inc()
-	if !protected {
+	protectors := a.resolveProtectors(ctx, &pod)
+	metrics.EvictionAttemptsObserved.WithLabelValues(strconv.FormatBool(len(protectors) > 0)).Inc()
+	if len(protectors) == 0 {
 		return allowed
 	}
 
@@ -105,39 +113,39 @@ func (a *Adapter) Handle(ctx context.Context, req admission.Request) admission.R
 	logf.FromContext(ctx).V(1).Info("eviction attempt observed",
 		"pod", req.Namespace+"/"+req.Name, "node", pod.Spec.NodeName, "evictor", req.UserInfo.Username)
 
-	if !cr.ExperimentalEvictionHold() {
-		return allowed
+	for _, p := range protectors {
+		if p.cr.HostageModeOrDefault() == appsv1alpha1.HostageOff ||
+			p.cr.Status.Phase == appsv1alpha1.PhaseRelaxed ||
+			a.standInReady(ctx, p.dep, pod.Spec.NodeName) {
+			continue
+		}
+		metrics.EvictionsHeld.Inc()
+		logf.FromContext(ctx).Info("Eviction held; stand-in not ready",
+			"pod", req.Namespace+"/"+req.Name, "evictor", req.UserInfo.Username)
+		return admission.Response{AdmissionResponse: admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Status:  metav1.StatusFailure,
+				Code:    http.StatusTooManyRequests,
+				Reason:  metav1.StatusReasonTooManyRequests,
+				Message: fmt.Sprintf("understudy is preparing a stand-in for %s/%s; retry shortly", req.Namespace, req.Name),
+			},
+		}}
 	}
-	if cr.HostageModeOrDefault() == appsv1alpha1.HostageOff {
-		return allowed
-	}
-	if cr.Status.Phase == appsv1alpha1.PhaseRelaxed {
-		return allowed
-	}
-	if a.standInReady(ctx, dep) {
-		return allowed
-	}
-	metrics.EvictionsHeld.Inc()
-	logf.FromContext(ctx).Info("eviction held; stand-in not ready",
-		"pod", req.Namespace+"/"+req.Name, "evictor", req.UserInfo.Username)
-	return admission.Response{AdmissionResponse: admissionv1.AdmissionResponse{
-		Allowed: false,
-		Result: &metav1.Status{
-			Status:  metav1.StatusFailure,
-			Code:    http.StatusTooManyRequests,
-			Reason:  metav1.StatusReasonTooManyRequests,
-			Message: fmt.Sprintf("understudy is preparing a stand-in for %s/%s; retry shortly", req.Namespace, req.Name),
-		},
-	}}
+	return allowed
 }
 
-func (a *Adapter) resolveProtector(ctx context.Context, pod *corev1.Pod) (*appsv1alpha1.Understudy, *appsv1.Deployment, bool) {
+func (a *Adapter) resolveProtectors(ctx context.Context, pod *corev1.Pod) []protector {
 	var crs appsv1alpha1.UnderstudyList
 	if err := a.reader.List(ctx, &crs, client.InNamespace(pod.Namespace)); err != nil {
-		return nil, nil, false
+		return nil
 	}
+	var protectors []protector
 	for i := range crs.Items {
 		cr := &crs.Items[i]
+		if cr.Status.Phase == appsv1alpha1.PhaseUnsupported {
+			continue
+		}
 		if kind := cr.Spec.TargetRef.Kind; kind != "" && kind != "Deployment" {
 			continue
 		}
@@ -150,13 +158,13 @@ func (a *Adapter) resolveProtector(ctx context.Context, pod *corev1.Pod) (*appsv
 			continue
 		}
 		if selector.Matches(labels.Set(pod.Labels)) {
-			return cr, &dep, true
+			protectors = append(protectors, protector{cr: cr, dep: &dep})
 		}
 	}
-	return nil, nil, false
+	return protectors
 }
 
-func (a *Adapter) standInReady(ctx context.Context, dep *appsv1.Deployment) bool {
+func (a *Adapter) standInReady(ctx context.Context, dep *appsv1.Deployment, victimNode string) bool {
 	base := int32(1)
 	if dep.Spec.Replicas != nil {
 		base = *dep.Spec.Replicas
@@ -181,6 +189,12 @@ func (a *Adapter) standInReady(ctx context.Context, dep *appsv1.Deployment) bool
 		if p.DeletionTimestamp != nil {
 			continue
 		}
+		if p.Spec.NodeName == victimNode {
+			continue
+		}
+		if _, doomed := a.registry.Lookup(p.Spec.NodeName); doomed {
+			continue
+		}
 		for _, c := range p.Status.Conditions {
 			if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
 				healthy++
@@ -188,5 +202,5 @@ func (a *Adapter) standInReady(ctx context.Context, dep *appsv1.Deployment) bool
 			}
 		}
 	}
-	return healthy > int(base)
+	return healthy >= int(base)
 }

@@ -119,7 +119,7 @@ func (r *Registry) Lookup(node string) (NodeDoom, bool) {
 	return best, true
 }
 
-func (r *Registry) StartJanitor(ctx context.Context, interval time.Duration) {
+func (r *Registry) StartExpiryLoop(ctx context.Context, interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()

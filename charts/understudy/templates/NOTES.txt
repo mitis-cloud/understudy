@@ -18,7 +18,9 @@ Give a Deployment an understudy:
 Alert on the metric understudy_oldest_blocked_eviction_seconds: a blocked
 drain must page a human, never wedge a node.
 
-ESCAPE HATCH - if the operator is ever gone while its PDBs still block
-drains, every PDB it owns is labeled for one-command removal:
+ESCAPE HATCH - delete the fail-open webhook configuration to disable holds
+immediately:
 
-  kubectl delete pdb -A -l understudy.sh/owned=true
+  kubectl delete validatingwebhookconfiguration {{ include "understudy.fullname" . }}-eviction-hold
+
+If every operator replica is unavailable, Kubernetes admits evictions normally.

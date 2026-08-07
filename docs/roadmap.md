@@ -1,76 +1,37 @@
 # Roadmap
 
-Milestone 1 (shipped in this repo) is the core surge state machine plus the
-two universal signal adapters. Everything below plugs into the same
-`signal.Adapter` / `signal.NodeDoom` contract - none of it touches core.
+## v0.4.0 - admission-time eviction hold
 
-## Milestone 2 - eviction webhook (shipped in v0.2.0)
+The validating webhook is now the enforcement point. It returns the same HTTP
+429 as a PodDisruptionBudget until a healthy stand-in is ready, then admits the
+drainer's retry. Understudy owns no budgets.
 
-An observe-only ValidatingWebhook on `pods/eviction` CREATE: the universal
-fallback that sees every eviction attempt from every drainer past, present
-and future - including attempts the PDB then rejects with 429 (empirically
-verified during the project's analysis phase; admission runs before the
-eviction registry's PDB check). Design points:
+This resolves budget-pinned nodes structurally. Karpenter was live-observed
+retrying the webhook 21 times over 43 seconds and completing when admission
+opened, with no `DisruptionBlocked` event. `kubectl drain` followed the same
+retry path. A startup migration sweep removes 0.3.x budgets.
 
-- **Fail-open, always-allow.** `failurePolicy: Ignore`, admits everything;
-  the PDB does the blocking. Operator down -> plain-Kubernetes behavior.
-- The AdmissionReview carries pod name/namespace and the evictor's
-  `userInfo` - free `NodeDoom.Source` attribution (which service account is
-  draining).
-- Signal shape: `NodeDoom{Class: VoluntaryUnbounded}` for the pod's node -
-  an evictor that retries is by definition waiting on us.
-- Needs cert management (cert-manager or built-in rotation) - the reason
-  it's not in the bootstrap milestone.
+The failure posture is intentionally fail-open: operator unavailability creates
+a protection gap, not a stuck cluster. PDB migration RBAC remains through
+v0.4.x and will be removed in v0.5.0.
 
-## Milestone 3 - cloud sentinels (shipped in v0.2.0; AWS live-validated, GCP and Azure experimental)
+## Shipped foundations
 
-Per-node probes (DaemonSet) that watch each cloud's metadata channel and
-normalize to `NodeDoom{Involuntary, deadline}`. Deadlines are data measured
-from the cloud's own notice - never constants. Per-cloud notes (full signal
-matrix in the README):
+- Core surge state machine with cordon and taint adapters
+- Universal eviction webhook and admission hold
+- AWS cloud sentinel, with GCP and Azure probes covered by unit tests
+- Readiness gates, deletion-cost steering and bounded hold relaxation
 
-- **AWS**: IMDS spot ITN (~120s) + rebalance recommendation (early,
-  non-guaranteed - surging on it is a churn/cost knob, off by default).
-- **GCP**: metadata `preempted` hanging-GET (~30s total, ACPI fires
-  immediately by default) - always below `minSurgeTimeSeconds`, so the value
-  is fast *release*, not surge.
-- **Azure**: Scheduled Events (Preempt 30s; Redeploy/Terminate 5-15 min) -
-  uniquely, events can be **held and approved early** once the surge
-  completes; the sentinel should exploit this.
+## Open design items
 
-This is the only place cloud SDKs/endpoints will ever live.
-
-## Post-M3 / open design items
-
-- **Budget-pinned nodes are reported, never resolved.** Karpenter dry-runs
-  PDBs and refuses to start consolidation, drift or expiry while
-  `disruptionsAllowed=0`; cluster-autoscaler pre-checks similarly. The
-  hostage PDB can therefore pin a node with no drain signal ever appearing.
-  Settled position: understudy detects the refusal and surfaces it (the
-  `NodePinned` condition, a Warning event, `understudy_node_pinned_total`)
-  and the README documents the mitigations, but the operator does not act.
-  Measured on Karpenter 1.12, a NodePool `terminationGracePeriod` does NOT
-  lift the pin: a node claim carrying it is still refused with `Pdb
-  prevents pod evictions` during candidate selection. It bounds a drain
-  that has started, so it belongs with the node-claim-deletion path, not on
-  its own. What actually moves a pinned pod is rescheduling it.
-  Acting would mean initiating pod movement on another controller's
-  behalf, which is out of scope by design: understudy reacts to
-  disruptions, it never starts one.
-- **Azure event approval.** Azure Scheduled Events can be held and approved
-  early; the sentinel currently only reads them. Approving once the surge is
-  traffic-ready would make Azure the only cloud where an involuntary
-  disruption is fully mediated.
-- **GCP and Azure sentinels are untested against real infrastructure.** Both
-  are covered by fake-metadata-server unit tests only. They must be labelled
-  experimental until someone runs them on GKE and AKS.
-- **GitOps coexistence.** Argo CD / Flux will fight the replica bump.
-  Mitigations to document/implement: `ignoreDifferences` recipes, or driving
-  the surge through a separate standby Deployment instead of `spec.replicas`.
-- **EvictionRequest API migration.** KEP-4563 (alpha targeted v1.37) gives
-  controllers a first-class hook on eviction intent. When it lands and
-  drainers adopt it, Understudy becomes an EvictionRequest *responder* that
-  surges before acking - same state machine, better signal, no hostage PDB.
-  The `signal.Adapter` contract is where it plugs in.
-- **kubectl plugin** (`kubectl understudy status`) for incident-time
+- **Azure event approval.** Scheduled Events can be approved after traffic
+  readiness instead of merely observed.
+- **GCP and Azure live validation.** Both sentinels remain experimental until
+  exercised against their real metadata services.
+- **GitOps coexistence.** Document Argo CD and Flux `ignoreDifferences`
+  recipes, or move surge state to a separate standby Deployment.
+- **EvictionRequest migration.** KEP-4563 is the future interception point.
+  When drainers adopt it, the same state machine can respond before acking
+  without changing the product boundary.
+- **kubectl plugin.** Add `kubectl understudy status` for incident-time
   visibility.

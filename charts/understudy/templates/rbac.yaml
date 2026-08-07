@@ -20,7 +20,7 @@ rules:
     verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "update", "patch"]

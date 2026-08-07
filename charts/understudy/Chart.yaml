@@ -5,14 +5,14 @@ description: >-
   downtime from announced node disruptions (drains, upgrades, consolidation,
   spot reclaims) without a standing second replica.
 type: application
-version: 0.3.1
-appVersion: "0.3.1"
+version: 0.4.0
+appVersion: "0.4.0"
 kubeVersion: ">=1.34.0-0"
 keywords:
   - availability
   - spot
   - eviction
-  - pdb
+  - admission-webhook
   - node-drain
   - karpenter
   - cluster-autoscaler

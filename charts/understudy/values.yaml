@@ -14,10 +14,10 @@ signals:
     - karpenter.sh/disrupted
     - ToBeDeletedByClusterAutoscaler
     - DeletionCandidateOfClusterAutoscaler
-  evictionWebhook: true
-  evictionWebhookTimeoutSeconds: 2
-  evictionWebhookNamespaceSelector: {}
-  pinDetection: true
+
+webhook:
+  timeoutSeconds: 2
+  namespaceSelector: {}
 
 sentinel:
   enabled: false
@@ -27,17 +27,6 @@ sentinel:
   nodeSelector: {}
   tolerations:
     - operator: Exists
-  resources:
-    requests:
-      cpu: 10m
-      memory: 32Mi
-    limits:
-      memory: 64Mi
-
-failsafe:
-  enabled: true
-  schedule: "*/5 * * * *"
-  staleAfter: 15m
   resources:
     requests:
       cpu: 10m

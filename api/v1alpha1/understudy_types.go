@@ -45,9 +45,6 @@ const (
 	ConditionProtected            = "Protected"
 	ConditionSurgeReady           = "SurgeReady"
 	ConditionZeroDowntimeStrategy = "ZeroDowntimeUpdateStrategy"
-	ConditionNodePinned           = "NodePinned"
-
-	AnnotationExperimentalEvictionHold = "understudy.sh/experimental-eviction-hold"
 )
 
 type TargetReference struct {
@@ -137,10 +134,6 @@ func init() {
 		s.AddKnownTypes(SchemeGroupVersion, &Understudy{}, &UnderstudyList{})
 		return nil
 	})
-}
-
-func (u *Understudy) ExperimentalEvictionHold() bool {
-	return u.Annotations[AnnotationExperimentalEvictionHold] == "true"
 }
 
 func (u *Understudy) SurgeReplicasOrDefault() int32 {

@@ -24,7 +24,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,20 +44,15 @@ import (
 
 const (
 	AnnotationBaseReplicas    = "understudy.sh/base-replicas"
-	AnnotationRelaxed         = "understudy.sh/relaxed"
-	AnnotationHeartbeat       = "understudy.sh/heartbeat"
 	LabelOwned                = "understudy.sh/owned"
 	PodDeletionCostAnnotation = "controller.kubernetes.io/pod-deletion-cost"
 	doomedPodDeletionCost     = "-1000"
 
-	ownedLabelValue     = "true"
 	relaxReasonTTL      = "ttl"
 	relaxReasonDeadline = "deadline"
 	relaxReasonMode     = "mode"
 
-	activeRequeue    = 5 * time.Second
-	heartbeatPeriod  = 60 * time.Second
-	protectedRequeue = 60 * time.Second
+	activeRequeue = 5 * time.Second
 )
 
 type UnderstudyReconciler struct {
@@ -82,7 +76,7 @@ type podAssessment struct {
 // +kubebuilder:rbac:groups=apps.understudy.sh,resources=understudies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps.understudy.sh,resources=understudies/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;patch
@@ -142,21 +136,7 @@ func (r *UnderstudyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	mode := cr.HostageModeOrDefault()
 	relaxReason, ttlExpired := r.relaxDecision(&cr, mode, assessment, surgeReady, status.BlockedSince)
-	holdMode := cr.ExperimentalEvictionHold()
-	pdbMode := mode
-	if holdMode {
-		pdbMode = appsv1alpha1.HostageOff
-	}
-	protected, err := r.ensurePDB(ctx, &cr, &dep, base, pdbMode, relaxReason, len(assessment.doomed) > 0)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if holdMode && mode != appsv1alpha1.HostageOff {
-		setCond(&status, &cr, appsv1alpha1.ConditionProtected, boolToStatus(relaxReason == ""), "EvictionHold",
-			"experimental: evictions are held at admission while a stand-in is prepared; no budget is owned")
-	} else {
-		setProtectedCondition(&status, &cr, protected, mode, relaxReason)
-	}
+	setProtectedCondition(&status, &cr, mode, relaxReason)
 
 	switch {
 	case len(assessment.doomed) == 0 && !surgeActive:
@@ -164,11 +144,7 @@ func (r *UnderstudyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		status.BlockedSince = nil
 		metrics.UntrackBlocked(req.String())
 		setCond(&status, &cr, appsv1alpha1.ConditionSurgeReady, boolToStatus(surgeReady), "Steady", "no disruption in sight")
-		result := ctrl.Result{}
-		if mode != appsv1alpha1.HostageOff {
-			result.RequeueAfter = protectedRequeue
-		}
-		return result, r.patchStatus(ctx, &cr, status)
+		return ctrl.Result{}, r.patchStatus(ctx, &cr, status)
 
 	case len(assessment.doomed) == 0 && surgeActive:
 		return r.reconcileScaleBack(ctx, &cr, &dep, status, assessment, base, req)
@@ -292,6 +268,7 @@ func (r *UnderstudyReconciler) reconcileDoomed(ctx context.Context, cr *appsv1al
 		return ctrl.Result{}, err
 	}
 
+	previousPhase := status.Phase
 	switch {
 	case surgeReady:
 		status.Phase = appsv1alpha1.PhaseReleasing
@@ -307,8 +284,11 @@ func (r *UnderstudyReconciler) reconcileDoomed(ctx context.Context, cr *appsv1al
 			now := metav1.Now()
 			status.LastReleaseTime = &now
 		}
-		r.eventOnce(cr, &status, corev1.EventTypeWarning, "PDBRelaxed", "Relax",
-			fmt.Sprintf("hostage PDB for %s relaxed (%s); eviction can proceed without a ready understudy", dep.Name, relaxReason))
+		if previousPhase != appsv1alpha1.PhaseRelaxed {
+			metrics.RelaxedTotal.WithLabelValues(relaxReason).Inc()
+		}
+		r.eventOnce(cr, &status, corev1.EventTypeWarning, "HoldRelaxed", "Relax",
+			fmt.Sprintf("eviction hold for %s relaxed (%s); eviction can proceed without a ready understudy", dep.Name, relaxReason))
 	default:
 		status.Phase = appsv1alpha1.PhaseSurging
 		setCond(&status, cr, appsv1alpha1.ConditionSurgeReady, metav1.ConditionFalse,
@@ -367,96 +347,6 @@ func (r *UnderstudyReconciler) clearDeletionCosts(ctx context.Context, pods []co
 	return nil
 }
 
-func (r *UnderstudyReconciler) ensurePDB(ctx context.Context, cr *appsv1alpha1.Understudy, dep *appsv1.Deployment,
-	base int32, mode appsv1alpha1.HostageMode, relaxReason string, predicamentActive bool) (bool, error) {
-
-	name := "understudy-" + cr.Name
-	key := types.NamespacedName{Namespace: cr.Namespace, Name: name}
-	var pdb policyv1.PodDisruptionBudget
-	getErr := r.Get(ctx, key, &pdb)
-
-	if mode == appsv1alpha1.HostageOff {
-		if getErr == nil {
-			return false, r.Delete(ctx, &pdb)
-		}
-		if apierrors.IsNotFound(getErr) {
-			return false, nil
-		}
-		return false, getErr
-	}
-
-	desiredMin := intstr.FromInt32(base)
-	relaxed := relaxReason != ""
-	if relaxed {
-		desiredMin = intstr.FromInt32(0)
-	}
-
-	if apierrors.IsNotFound(getErr) {
-		pdb = policyv1.PodDisruptionBudget{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: cr.Namespace,
-				Labels: map[string]string{
-					LabelOwned:                     ownedLabelValue,
-					"app.kubernetes.io/managed-by": "understudy",
-				},
-				Annotations: map[string]string{
-					AnnotationHeartbeat: strconv.FormatInt(time.Now().Unix(), 10),
-				},
-			},
-			Spec: policyv1.PodDisruptionBudgetSpec{
-				MinAvailable: &desiredMin,
-				Selector:     dep.Spec.Selector,
-			},
-		}
-		if relaxed {
-			pdb.Annotations[AnnotationRelaxed] = relaxReason
-		}
-		if err := ctrl.SetControllerReference(cr, &pdb, r.Scheme); err != nil {
-			return false, err
-		}
-		if err := r.Create(ctx, &pdb); err != nil {
-			return false, err
-		}
-		return !relaxed, nil
-	}
-	if getErr != nil {
-		return false, getErr
-	}
-
-	if prev, wasRelaxed := pdb.Annotations[AnnotationRelaxed]; wasRelaxed && predicamentActive && !relaxed {
-		relaxed = true
-		relaxReason = prev
-		desiredMin = intstr.FromInt32(0)
-	}
-
-	patched := pdb.DeepCopy()
-	patched.Spec.MinAvailable = &desiredMin
-	patched.Spec.Selector = dep.Spec.Selector
-	if patched.Annotations == nil {
-		patched.Annotations = map[string]string{}
-	}
-	now := time.Now()
-	if prev, err := strconv.ParseInt(patched.Annotations[AnnotationHeartbeat], 10, 64); err != nil ||
-		now.Sub(time.Unix(prev, 0)) >= heartbeatPeriod {
-		patched.Annotations[AnnotationHeartbeat] = strconv.FormatInt(now.Unix(), 10)
-	}
-	if relaxed {
-		if _, ok := patched.Annotations[AnnotationRelaxed]; !ok {
-			patched.Annotations[AnnotationRelaxed] = relaxReason
-			metrics.RelaxedTotal.WithLabelValues(relaxReason).Inc()
-		}
-	} else {
-		delete(patched.Annotations, AnnotationRelaxed)
-	}
-	if !equalPDB(&pdb, patched) {
-		if err := r.Patch(ctx, patched, client.MergeFrom(&pdb)); err != nil {
-			return false, err
-		}
-	}
-	return !relaxed, nil
-}
-
 func (r *UnderstudyReconciler) markUnsupported(ctx context.Context, cr *appsv1alpha1.Understudy,
 	status appsv1alpha1.UnderstudyStatus, msg string) (ctrl.Result, error) {
 	alreadyMarked := status.Phase == appsv1alpha1.PhaseUnsupported
@@ -496,16 +386,15 @@ func (r *UnderstudyReconciler) setStrategyCondition(status *appsv1alpha1.Underst
 }
 
 func setProtectedCondition(status *appsv1alpha1.UnderstudyStatus, cr *appsv1alpha1.Understudy,
-	protected bool, mode appsv1alpha1.HostageMode, relaxReason string) {
-	if protected {
-		setCond(status, cr, appsv1alpha1.ConditionProtected, metav1.ConditionTrue, "HostagePDB", "blocking PDB in place")
-		return
-	}
+	mode appsv1alpha1.HostageMode, relaxReason string) {
 	reason, msg := "HostageOff", "hostageMode is off; evictions are not blocked"
 	if mode != appsv1alpha1.HostageOff {
-		reason, msg = "Relaxed", "hostage PDB relaxed ("+relaxReason+"); evictions may proceed"
+		reason, msg = "EvictionHold", "evictions are held at admission while a stand-in is prepared"
+		if relaxReason != "" {
+			reason, msg = "Relaxed", "eviction hold relaxed ("+relaxReason+"); evictions may proceed"
+		}
 	}
-	setCond(status, cr, appsv1alpha1.ConditionProtected, metav1.ConditionFalse, reason, msg)
+	setCond(status, cr, appsv1alpha1.ConditionProtected, boolToStatus(mode != appsv1alpha1.HostageOff && relaxReason == ""), reason, msg)
 }
 
 func (r *UnderstudyReconciler) patchStatus(ctx context.Context, cr *appsv1alpha1.Understudy, status appsv1alpha1.UnderstudyStatus) error {
@@ -547,7 +436,6 @@ func (r *UnderstudyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.Understudy{}).
-		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(&appsv1.Deployment{}, handler.EnqueueRequestsFromMapFunc(mapDeployment)).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPod)).
 		WatchesRawSource(source.Channel(r.Registry.Subscribe(64), handler.EnqueueRequestsFromMapFunc(mapDoom))).
@@ -645,19 +533,6 @@ func timePtrEqual(a, b *metav1.Time) bool {
 		return a == b
 	}
 	return a.Equal(b)
-}
-
-func equalPDB(a, b *policyv1.PodDisruptionBudget) bool {
-	switch {
-	case a.Spec.MinAvailable == nil || b.Spec.MinAvailable == nil:
-		if a.Spec.MinAvailable != b.Spec.MinAvailable {
-			return false
-		}
-	case *a.Spec.MinAvailable != *b.Spec.MinAvailable:
-		return false
-	}
-	return a.Annotations[AnnotationRelaxed] == b.Annotations[AnnotationRelaxed] &&
-		a.Annotations[AnnotationHeartbeat] == b.Annotations[AnnotationHeartbeat]
 }
 
 func doomSource(d *signal.NodeDoom) string {

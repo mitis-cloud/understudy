@@ -32,9 +32,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	appsv1alpha1 "github.com/kylan11/understudy/api/v1alpha1"
+	"github.com/kylan11/understudy/internal/signal"
 )
-
-const holdEnabled = "true"
 
 func evict(pod *corev1.Pod, dryRun bool) error {
 	eviction := &policyv1.Eviction{
@@ -52,17 +51,11 @@ var _ = Describe("Eviction webhook adapter", func() {
 	It("surges when a protected pod's eviction is attempted, with no node signal at all", func() {
 		f := newFixture(nil)
 
-		By("waiting for the hostage PDB so the pod counts as protected")
-		Eventually(func() error {
-			_, err := getPDB(f)
-			return err
-		}).Should(Succeed())
-
-		By("attempting an eviction the PDB will reject")
+		By("attempting an eviction the webhook will reject")
 		Eventually(func() bool {
 			err := evict(f.pod, false)
 			return err != nil
-		}).Should(BeTrue(), "the hostage PDB should reject the eviction with 429")
+		}).Should(BeTrue(), "the eviction hold should reject the eviction with 429")
 
 		By("surging purely on the observed eviction attempt")
 		Eventually(func() int32 {
@@ -77,7 +70,7 @@ var _ = Describe("Eviction webhook adapter", func() {
 
 	It("ignores evictions of pods that no Understudy protects", func() {
 		f := newFixture(nil)
-		Eventually(func() error { _, err := getPDB(f); return err }).Should(Succeed())
+		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseIdle))
 
 		By("creating an unrelated pod on the same node")
 		other := makePod(f.ns, "bystander", "bystander", f.node.Name, true)
@@ -92,7 +85,7 @@ var _ = Describe("Eviction webhook adapter", func() {
 
 	It("ignores dry-run eviction attempts", func() {
 		f := newFixture(nil)
-		Eventually(func() error { _, err := getPDB(f); return err }).Should(Succeed())
+		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseIdle))
 
 		By("issuing a dry-run eviction")
 		_ = evict(f.pod, true)
@@ -101,15 +94,12 @@ var _ = Describe("Eviction webhook adapter", func() {
 		Consistently(func() int32 { return *getDeployment(f).Spec.Replicas }).Should(Equal(int32(1)))
 	})
 
-	It("holds evictions at admission instead of owning a budget (experimental)", func() {
-		f := newFixture(func(cr *appsv1alpha1.Understudy) {
-			cr.Annotations = map[string]string{appsv1alpha1.AnnotationExperimentalEvictionHold: holdEnabled}
-		})
+	It("holds evictions at admission instead of owning a budget", func() {
+		f := newFixture(nil)
 
 		By("owning no budget at all")
 		Consistently(func() bool {
-			_, err := getPDB(f)
-			return apierrors.IsNotFound(err)
+			return apierrors.IsNotFound(getPDB(f))
 		}).Should(BeTrue())
 
 		By("answering the eviction with 429, exactly as a budget would")
@@ -135,9 +125,8 @@ var _ = Describe("Eviction webhook adapter", func() {
 		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseIdle))
 	})
 
-	It("never wedges in hold mode: the readiness TTL admits the eviction (experimental)", func() {
+	It("never wedges in hold mode: the readiness TTL admits the eviction", func() {
 		f := newFixture(func(cr *appsv1alpha1.Understudy) {
-			cr.Annotations = map[string]string{appsv1alpha1.AnnotationExperimentalEvictionHold: holdEnabled}
 			cr.Spec.ReadinessDeadlineSeconds = ptr.To(int32(3))
 		})
 
@@ -152,7 +141,6 @@ var _ = Describe("Eviction webhook adapter", func() {
 
 	It("un-surges once eviction attempts stop and the signal expires", func() {
 		f := newFixture(nil)
-		Eventually(func() error { _, err := getPDB(f); return err }).Should(Succeed())
 
 		By("triggering a surge via an eviction attempt")
 		Eventually(func() bool { return evict(f.pod, false) != nil }).Should(BeTrue())
@@ -161,5 +149,56 @@ var _ = Describe("Eviction webhook adapter", func() {
 		By("letting the signal expire naturally once attempts stop")
 		Eventually(func() int32 { return *getDeployment(f).Spec.Replicas }).Should(Equal(int32(1)))
 		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseIdle))
+	})
+
+	It("keeps holding when a ready stand-in is on the victim or another doomed node", func() {
+		f := newFixture(nil)
+		Eventually(func() bool { return evict(f.pod, false) != nil }).Should(BeTrue())
+		makePod(f.ns, "same-node-understudy", f.dep.Name, f.node.Name, true)
+		Consistently(func() bool { return apierrors.IsTooManyRequests(evict(f.pod, false)) }).Should(BeTrue())
+
+		doomedNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: f.ns + "-doomed"}}
+		Expect(k8sClient.Create(ctx, doomedNode)).To(Succeed())
+		registry.Set(signal.NodeDoom{Node: doomedNode.Name, Class: signal.VoluntaryUnbounded, Source: "test"})
+		DeferCleanup(func() { registry.Clear(doomedNode.Name, "test") })
+		makePod(f.ns, "doomed-node-understudy", f.dep.Name, doomedNode.Name, true)
+		Consistently(func() bool { return apierrors.IsTooManyRequests(evict(f.pod, false)) }).Should(BeTrue())
+
+		clearNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: f.ns + "-clear"}}
+		Expect(k8sClient.Create(ctx, clearNode)).To(Succeed())
+		makePod(f.ns, "clear-node-understudy", f.dep.Name, clearNode.Name, true)
+		Eventually(func() error { return evict(f.pod, false) }).Should(Succeed())
+	})
+
+	It("never holds an unsupported target", func() {
+		f := newFixture(func(cr *appsv1alpha1.Understudy) {
+			cr.Spec.TargetRef.Kind = "StatefulSet"
+		})
+		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseUnsupported))
+		Expect(evict(f.pod, false)).To(Succeed())
+	})
+
+	It("requires every matching protector to admit", func() {
+		f := newFixture(nil)
+		second := makeDeployment(f.ns, "second", 2)
+		second.Spec.Selector = f.dep.Spec.Selector.DeepCopy()
+		second.Spec.Template.Labels = map[string]string{appLabel: f.dep.Name}
+		Expect(k8sClient.Create(ctx, second)).To(Succeed())
+		settleDeployment(second)
+		secondCR := &appsv1alpha1.Understudy{
+			ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: f.ns},
+			Spec: appsv1alpha1.UnderstudySpec{
+				TargetRef: appsv1alpha1.TargetReference{Name: second.Name},
+			},
+		}
+		Expect(k8sClient.Create(ctx, secondCR)).To(Succeed())
+
+		Eventually(func() bool { return evict(f.pod, false) != nil }).Should(BeTrue())
+		clearNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: f.ns + "-clear-multi"}}
+		Expect(k8sClient.Create(ctx, clearNode)).To(Succeed())
+		makePod(f.ns, "first-clear", f.dep.Name, clearNode.Name, true)
+		Consistently(func() bool { return apierrors.IsTooManyRequests(evict(f.pod, false)) }).Should(BeTrue())
+		makePod(f.ns, "second-clear", f.dep.Name, clearNode.Name, true)
+		Eventually(func() error { return evict(f.pod, false) }).Should(Succeed())
 	})
 })
