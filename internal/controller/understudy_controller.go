@@ -51,6 +51,7 @@ const (
 	PodDeletionCostAnnotation = "controller.kubernetes.io/pod-deletion-cost"
 	doomedPodDeletionCost     = "-1000"
 
+	ownedLabelValue     = "true"
 	relaxReasonTTL      = "ttl"
 	relaxReasonDeadline = "deadline"
 	relaxReasonMode     = "mode"
@@ -141,11 +142,21 @@ func (r *UnderstudyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	mode := cr.HostageModeOrDefault()
 	relaxReason, ttlExpired := r.relaxDecision(&cr, mode, assessment, surgeReady, status.BlockedSince)
-	protected, err := r.ensurePDB(ctx, &cr, &dep, base, mode, relaxReason, len(assessment.doomed) > 0)
+	holdMode := cr.ExperimentalEvictionHold()
+	pdbMode := mode
+	if holdMode {
+		pdbMode = appsv1alpha1.HostageOff
+	}
+	protected, err := r.ensurePDB(ctx, &cr, &dep, base, pdbMode, relaxReason, len(assessment.doomed) > 0)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	setProtectedCondition(&status, &cr, protected, mode, relaxReason)
+	if holdMode && mode != appsv1alpha1.HostageOff {
+		setCond(&status, &cr, appsv1alpha1.ConditionProtected, boolToStatus(relaxReason == ""), "EvictionHold",
+			"experimental: evictions are held at admission while a stand-in is prepared; no budget is owned")
+	} else {
+		setProtectedCondition(&status, &cr, protected, mode, relaxReason)
+	}
 
 	switch {
 	case len(assessment.doomed) == 0 && !surgeActive:
@@ -386,7 +397,7 @@ func (r *UnderstudyReconciler) ensurePDB(ctx context.Context, cr *appsv1alpha1.U
 				Name:      name,
 				Namespace: cr.Namespace,
 				Labels: map[string]string{
-					LabelOwned:                     "true",
+					LabelOwned:                     ownedLabelValue,
 					"app.kubernetes.io/managed-by": "understudy",
 				},
 				Annotations: map[string]string{

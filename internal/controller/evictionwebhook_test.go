@@ -17,17 +17,24 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
+	"time"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	appsv1alpha1 "github.com/kylan11/understudy/api/v1alpha1"
 )
+
+const holdEnabled = "true"
 
 func evict(pod *corev1.Pod, dryRun bool) error {
 	eviction := &policyv1.Eviction{
@@ -92,6 +99,55 @@ var _ = Describe("Eviction webhook adapter", func() {
 
 		By("never surging")
 		Consistently(func() int32 { return *getDeployment(f).Spec.Replicas }).Should(Equal(int32(1)))
+	})
+
+	It("holds evictions at admission instead of owning a budget (experimental)", func() {
+		f := newFixture(func(cr *appsv1alpha1.Understudy) {
+			cr.Annotations = map[string]string{appsv1alpha1.AnnotationExperimentalEvictionHold: holdEnabled}
+		})
+
+		By("owning no budget at all")
+		Consistently(func() bool {
+			_, err := getPDB(f)
+			return apierrors.IsNotFound(err)
+		}).Should(BeTrue())
+
+		By("answering the eviction with 429, exactly as a budget would")
+		var evictErr error
+		Eventually(func() bool {
+			evictErr = evict(f.pod, false)
+			return evictErr != nil
+		}).Should(BeTrue())
+		Expect(apierrors.IsTooManyRequests(evictErr)).To(BeTrue(),
+			fmt.Sprintf("the hold must be indistinguishable from a budget block; got: %v", evictErr))
+
+		By("surging on the held attempt")
+		Eventually(func() int32 { return *getDeployment(f).Spec.Replicas }).Should(Equal(int32(2)))
+
+		By("admitting the eviction once the stand-in is ready")
+		clearNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: f.ns + "-clear"}}
+		Expect(k8sClient.Create(ctx, clearNode)).To(Succeed())
+		makePod(f.ns, "lead-understudy", f.dep.Name, clearNode.Name, true)
+		Eventually(func() error { return evict(f.pod, false) }).Should(Succeed())
+
+		By("scaling back once the old pod is gone")
+		Eventually(func() int32 { return *getDeployment(f).Spec.Replicas }).Should(Equal(int32(1)))
+		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseIdle))
+	})
+
+	It("never wedges in hold mode: the readiness TTL admits the eviction (experimental)", func() {
+		f := newFixture(func(cr *appsv1alpha1.Understudy) {
+			cr.Annotations = map[string]string{appsv1alpha1.AnnotationExperimentalEvictionHold: holdEnabled}
+			cr.Spec.ReadinessDeadlineSeconds = ptr.To(int32(3))
+		})
+
+		By("holding the first attempts")
+		Eventually(func() bool { return evict(f.pod, false) != nil }).Should(BeTrue())
+		Eventually(func() int32 { return *getDeployment(f).Spec.Replicas }).Should(Equal(int32(2)))
+		makePod(f.ns, "lead-understudy", f.dep.Name, f.node.Name, false)
+
+		By("admitting after the deadline even with no ready stand-in")
+		Eventually(func() error { return evict(f.pod, false) }, 20*time.Second).Should(Succeed())
 	})
 
 	It("un-surges once eviction attempts stop and the signal expires", func() {
