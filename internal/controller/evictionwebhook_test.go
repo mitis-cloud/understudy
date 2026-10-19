@@ -176,6 +176,26 @@ var _ = Describe("Eviction webhook adapter", func() {
 		Eventually(func() error { return evict(f.pod, false) }).Should(Succeed())
 	})
 
+	It("counts a stand-in only once it has been ready for the target's minReadySeconds", func() {
+		f := newFixture(nil, func(dep *appsv1.Deployment) { dep.Spec.MinReadySeconds = 30 })
+		cordonNode(f.node)
+		expectSurged(f)
+
+		By("holding while the stand-in has been ready for less than minReadySeconds")
+		clearNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: f.ns + "-clear"}}
+		Expect(k8sClient.Create(ctx, clearNode)).To(Succeed())
+		standIn := makePod(f.ns, "lead-understudy", f.dep.Name, clearNode.Name, true)
+		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseSurging))
+		Consistently(func() bool {
+			return apierrors.IsTooManyRequests(evict(f.pod, false)) && getCR(f).Status.Phase == appsv1alpha1.PhaseSurging
+		}).Should(BeTrue())
+
+		By("releasing once the stand-in is available")
+		markPodReadySince(standIn, time.Now().Add(-31*time.Second))
+		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseReleasing))
+		Eventually(func() error { return evict(f.pod, false) }).Should(Succeed())
+	})
+
 	It("never holds an unsupported target", func() {
 		f := newFixture(func(cr *appsv1alpha1.Understudy) {
 			cr.Spec.TargetRef.Kind = "StatefulSet"

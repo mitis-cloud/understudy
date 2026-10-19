@@ -18,8 +18,11 @@ package workload
 
 import (
 	"testing"
+	"time"
 
 	rolloutsv1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 )
@@ -77,6 +80,41 @@ func TestRolloutStandDown(t *testing.T) {
 			tt.mutate(ro)
 			if got := (&Target{Object: ro}).StandDown(); got != tt.want {
 				t.Fatalf("StandDown() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPodAvailable(t *testing.T) {
+	now := time.Now()
+	ready := func(status corev1.ConditionStatus, since time.Time) *corev1.Pod {
+		return &corev1.Pod{Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: status, LastTransitionTime: metav1.NewTime(since),
+		}}}}
+	}
+	tests := []struct {
+		name            string
+		pod             *corev1.Pod
+		minReadySeconds int32
+		want            bool
+	}{
+		{"no ready condition", &corev1.Pod{}, 0, false},
+		{"not ready", ready(corev1.ConditionFalse, now.Add(-time.Hour)), 0, false},
+		{"ready without minReadySeconds", ready(corev1.ConditionTrue, now), 0, true},
+		{"ready for less than minReadySeconds", ready(corev1.ConditionTrue, now.Add(-29*time.Second)), 30, false},
+		{"ready for exactly minReadySeconds", ready(corev1.ConditionTrue, now.Add(-30*time.Second)), 30, false},
+		{"ready for longer than minReadySeconds", ready(corev1.ConditionTrue, now.Add(-31*time.Second)), 30, true},
+		{"ready since an unknown time", ready(corev1.ConditionTrue, time.Time{}), 30, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, target := range []*Target{
+				{Object: &appsv1.Deployment{Spec: appsv1.DeploymentSpec{MinReadySeconds: tt.minReadySeconds}}},
+				{Object: &rolloutsv1alpha1.Rollout{Spec: rolloutsv1alpha1.RolloutSpec{MinReadySeconds: tt.minReadySeconds}}},
+			} {
+				if got := target.PodAvailable(tt.pod, now); got != tt.want {
+					t.Errorf("%s PodAvailable() = %v, want %v", target.Kind(), got, tt.want)
+				}
 			}
 		})
 	}

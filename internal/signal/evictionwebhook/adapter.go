@@ -176,6 +176,7 @@ func (a *Adapter) standInReady(ctx context.Context, target *workload.Target, vic
 		return false
 	}
 	healthy := 0
+	now := time.Now()
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.DeletionTimestamp != nil || p.Spec.NodeName == "" {
@@ -187,11 +188,8 @@ func (a *Adapter) standInReady(ctx context.Context, target *workload.Target, vic
 		if _, doomed := a.registry.Lookup(p.Spec.NodeName); doomed {
 			continue
 		}
-		for _, c := range p.Status.Conditions {
-			if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-				healthy++
-				break
-			}
+		if target.PodAvailable(p, now) {
+			healthy++
 		}
 	}
 	return healthy >= int(base)

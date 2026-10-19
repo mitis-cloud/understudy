@@ -19,10 +19,11 @@ sentinel adapters normalize their observations into a `NodeDoom`.
 **3. Surge.** The controller increases the target workload's replica count and marks
 the old pod with a negative `controller.kubernetes.io/pod-deletion-cost`.
 
-**4. Wait for traffic readiness.** A stand-in counts only when it is Ready, is
-not deleting, and runs on neither the victim node nor another doomed node.
-Readiness gates therefore include load balancer registration. Once enough
-healthy stand-ins exist, the webhook admits the drainer's next retry.
+**4. Wait for traffic readiness.** A stand-in counts only when it has been Ready
+for the target's `minReadySeconds`, is not deleting, and runs on neither the
+victim node nor another doomed node. Readiness gates therefore include load
+balancer registration. Once enough healthy stand-ins exist, the webhook admits
+the drainer's next retry.
 
 **5. Scale back.** After the old pod leaves, the workload returns to its
 original replica count, or the latest requested `baselineReplicas` when capacity

@@ -205,6 +205,7 @@ func (r *UnderstudyReconciler) assessPods(ctx context.Context, cr *appsv1alpha1.
 		return a, err
 	}
 	a.all = podList.Items
+	now := time.Now()
 	for i := range podList.Items {
 		pod := &podList.Items[i]
 		if !serving.Matches(labels.Set(pod.Labels)) || pod.Spec.NodeName == "" || pod.DeletionTimestamp != nil {
@@ -218,7 +219,7 @@ func (r *UnderstudyReconciler) assessPods(ctx context.Context, cr *appsv1alpha1.
 			}
 			continue
 		}
-		if podReady(pod) {
+		if target.PodAvailable(pod, now) {
 			a.viable++
 		}
 	}
@@ -499,15 +500,6 @@ func (r *UnderstudyReconciler) requestsInNamespace(ctx context.Context, namespac
 		reqs = append(reqs, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
 	}
 	return reqs
-}
-
-func podReady(pod *corev1.Pod) bool {
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady {
-			return c.Status == corev1.ConditionTrue
-		}
-	}
-	return false
 }
 
 func setCond(status *appsv1alpha1.UnderstudyStatus, cr *appsv1alpha1.Understudy,

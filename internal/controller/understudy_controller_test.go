@@ -49,7 +49,7 @@ type fixture struct {
 	cr   *appsv1alpha1.Understudy
 }
 
-func newFixture(mutateCR func(*appsv1alpha1.Understudy)) *fixture {
+func newFixture(mutateCR func(*appsv1alpha1.Understudy), mutateDep ...func(*appsv1.Deployment)) *fixture {
 	nsCounter++
 	f := &fixture{ns: fmt.Sprintf("test-%d-%d", GinkgoRandomSeed(), nsCounter)}
 
@@ -61,6 +61,9 @@ func newFixture(mutateCR func(*appsv1alpha1.Understudy)) *fixture {
 	Expect(k8sClient.Create(ctx, f.node)).To(Succeed())
 
 	f.dep = makeDeployment(f.ns, "lead", 1)
+	for _, mutate := range mutateDep {
+		mutate(f.dep)
+	}
 	Expect(k8sClient.Create(ctx, f.dep)).To(Succeed())
 	settleDeployment(f.dep)
 
@@ -145,6 +148,10 @@ func makePod(ns, name, app, node string, ready bool) *corev1.Pod {
 }
 
 func markPodReady(pod *corev1.Pod) {
+	markPodReadySince(pod, time.Now())
+}
+
+func markPodReadySince(pod *corev1.Pod, since time.Time) {
 	Eventually(func() error {
 		current := &corev1.Pod{}
 		if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), current); err != nil {
@@ -152,8 +159,9 @@ func markPodReady(pod *corev1.Pod) {
 		}
 		current.Status.Phase = corev1.PodRunning
 		current.Status.Conditions = []corev1.PodCondition{{
-			Type:   corev1.PodReady,
-			Status: corev1.ConditionTrue,
+			Type:               corev1.PodReady,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: metav1.NewTime(since),
 		}}
 		return k8sClient.Status().Update(ctx, current)
 	}).Should(Succeed())

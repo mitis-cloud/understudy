@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	rolloutsv1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -89,6 +90,29 @@ func (t *Target) Replicas() int32 {
 		return 1
 	}
 	return *replicas
+}
+
+// PodAvailable applies the workload controller's own availability rule: Ready
+// for longer than the target's minReadySeconds.
+func (t *Target) PodAvailable(pod *corev1.Pod, now time.Time) bool {
+	minReady := time.Duration(t.minReadySeconds()) * time.Second
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue &&
+				(minReady == 0 || !c.LastTransitionTime.IsZero() && c.LastTransitionTime.Add(minReady).Before(now))
+		}
+	}
+	return false
+}
+
+func (t *Target) minReadySeconds() int32 {
+	switch obj := t.Object.(type) {
+	case *appsv1.Deployment:
+		return obj.Spec.MinReadySeconds
+	case *rolloutsv1alpha1.Rollout:
+		return obj.Spec.MinReadySeconds
+	}
+	return 0
 }
 
 func (t *Target) revision() string {
