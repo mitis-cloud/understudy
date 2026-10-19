@@ -5,8 +5,8 @@ description: >-
   downtime from announced node disruptions (drains, upgrades, consolidation,
   spot reclaims) without a standing second replica.
 type: application
-version: 0.4.4
-appVersion: "0.4.4"
+version: 0.4.5
+appVersion: "0.4.5"
 kubeVersion: ">=1.34.0-0"
 keywords:
   - availability
@@ -42,7 +42,7 @@ annotations:
       url: https://github.com/kylan11/understudy/issues
   artifacthub.io/images: |
     - name: understudy
-      image: ghcr.io/kylan11/understudy:0.4.4
+      image: ghcr.io/kylan11/understudy:0.4.5
   artifacthub.io/crds: |
     - kind: Understudy
       version: v1alpha1
@@ -65,9 +65,13 @@ annotations:
         minSurgeTimeSeconds: 60
         readinessDeadlineSeconds: 600
   artifacthub.io/changes: |
-    - kind: added
-      description: Optional baselineReplicas separates Git-owned desired capacity from effective Deployment and Rollout replicas, deferring capacity changes until handover completes
-    - kind: added
-      description: BaselineApplied status and documented Argo CD field delegation expose and preserve pending capacity changes
     - kind: fixed
-      description: Detect Deployment releases during an active surge and apply the latest baseline when application releases take over
+      description: Remove the obsolete sentinel mode flag and verify chart arguments against both binaries in CI
+    - kind: fixed
+      description: Honour Deployment and Rollout minReadySeconds before counting stand-ins as available
+    - kind: fixed
+      description: Bound eviction holds even when replica changes or pod deletion-cost updates fail
+    - kind: fixed
+      description: Watch node signals on every operator replica so standby webhooks exclude doomed nodes
+    - kind: security
+      description: Update x/net, gRPC, and OpenTelemetry dependencies past identified advisories

@@ -2,6 +2,23 @@
 
 Version-to-version notes. Anything not mentioned here needs no action.
 
+## 0.4.4 to 0.4.5
+
+Upgrade the chart and operator together:
+
+```sh
+helm upgrade understudy oci://ghcr.io/kylan11/charts/understudy \
+  --namespace understudy-system --version 0.4.5
+```
+
+There are no CRD schema or configuration changes from v0.4.4. This release fixes
+sentinel startup, bounds holds when surging fails, and watches node signals on
+every operator replica.
+
+Stand-ins now honour the target Deployment or Rollout's `minReadySeconds`.
+Allow for that warm-up period when configuring `readinessDeadlineSeconds`;
+the deadline still releases a hold if replacement availability takes too long.
+
 ## 0.4.3 to 0.4.4
 
 `spec.baselineReplicas` opts into continuous capacity management. Existing
