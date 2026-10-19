@@ -280,12 +280,13 @@ func (r *UnderstudyReconciler) reconcileDoomed(ctx context.Context, cr *appsv1al
 	}
 	metrics.TrackBlocked(req.String(), status.BlockedSince.Time)
 
+	// A failed surge still reaches the status patch below: the hold must be
+	// recorded for readinessDeadlineSeconds to be able to relax it.
+	var surgeErr error
 	if !surgeActive || cr.Spec.BaselineReplicas != nil && target.Replicas() != base+cr.SurgeReplicasOrDefault() {
-		if err := target.PatchReplicas(ctx, r.Client, base+cr.SurgeReplicasOrDefault(), &base); err != nil {
-			return ctrl.Result{}, err
-		}
+		surgeErr = target.PatchReplicas(ctx, r.Client, base+cr.SurgeReplicasOrDefault(), &base)
 	}
-	if !surgeActive {
+	if surgeErr == nil && !surgeActive {
 		now := metav1.Now()
 		status.LastSurgeTime = &now
 		class := signal.VoluntaryUnbounded
@@ -297,9 +298,11 @@ func (r *UnderstudyReconciler) reconcileDoomed(ctx context.Context, cr *appsv1al
 			fmt.Sprintf("node doom (%s) for pod(s) of %s; surging %d -> %d",
 				doomSource(a.worstDoom), target.GetName(), base, base+cr.SurgeReplicasOrDefault()))
 	}
-
-	if err := r.stampDeletionCosts(ctx, a.doomed); err != nil {
-		return ctrl.Result{}, err
+	if surgeErr == nil {
+		surgeErr = r.stampDeletionCosts(ctx, a.doomed)
+	}
+	if surgeErr != nil {
+		logf.FromContext(ctx).Error(surgeErr, "Failed to surge workload", "kind", target.Kind(), "name", target.GetName())
 	}
 
 	previousPhase := status.Phase
@@ -323,6 +326,11 @@ func (r *UnderstudyReconciler) reconcileDoomed(ctx context.Context, cr *appsv1al
 		}
 		r.eventOnce(cr, &status, corev1.EventTypeWarning, "HoldRelaxed", "Relax",
 			fmt.Sprintf("eviction hold for %s relaxed (%s); eviction can proceed without a ready understudy", target.GetName(), relaxReason))
+	case surgeErr != nil:
+		status.Phase = appsv1alpha1.PhaseSurging
+		message := fmt.Sprintf("cannot surge %s: %v", target.GetName(), surgeErr)
+		setCond(&status, cr, appsv1alpha1.ConditionSurgeReady, metav1.ConditionFalse, "SurgeFailed", message)
+		r.eventOnce(cr, &status, corev1.EventTypeWarning, "SurgeFailed", "Surge", message)
 	default:
 		status.Phase = appsv1alpha1.PhaseSurging
 		setCond(&status, cr, appsv1alpha1.ConditionSurgeReady, metav1.ConditionFalse,

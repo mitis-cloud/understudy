@@ -109,8 +109,9 @@ relaxed before the eviction is admitted.
 Voluntary disruption is held until the stand-in is ready. An involuntary
 deadline is compared with `minSurgeTimeSeconds`; if too little time remains,
 the hold is relaxed immediately while the surge continues. A hold is also
-relaxed after `readinessDeadlineSeconds`, ensuring an unschedulable stand-in
-cannot wedge a drain forever.
+relaxed after `readinessDeadlineSeconds`, ensuring that neither an
+unschedulable stand-in nor a surge the API server refuses (`SurgeReady=False`,
+reason `SurgeFailed`) can wedge a drain forever.
 
 `holdMode` chooses which of those disruptions are held in the first
 place. `always` holds both classes, `voluntary-only` holds the unbounded

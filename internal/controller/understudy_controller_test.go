@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -182,6 +183,56 @@ func taintNode(node *corev1.Node, key string) {
 		})
 		return k8sClient.Update(ctx, current)
 	}).Should(Succeed())
+}
+
+// freezeReplicas makes the API server refuse every replica change to the
+// fixture's Deployment, as a policy engine or a missing permission would.
+func freezeReplicas(f *fixture) {
+	policy := &admissionv1.ValidatingAdmissionPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: f.ns + "-freeze-replicas"},
+		Spec: admissionv1.ValidatingAdmissionPolicySpec{
+			FailurePolicy: ptr.To(admissionv1.Fail),
+			MatchConstraints: &admissionv1.MatchResources{
+				ResourceRules: []admissionv1.NamedRuleWithOperations{{
+					RuleWithOperations: admissionv1.RuleWithOperations{
+						Operations: []admissionv1.OperationType{admissionv1.Update},
+						Rule: admissionv1.Rule{
+							APIGroups:   []string{"apps"},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"deployments"},
+						},
+					},
+				}},
+			},
+			Validations: []admissionv1.Validation{{
+				Expression: "object.spec.replicas == oldObject.spec.replicas",
+				Message:    "replicas are frozen",
+			}},
+		},
+	}
+	binding := &admissionv1.ValidatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: policy.Name},
+		Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+			PolicyName:        policy.Name,
+			ValidationActions: []admissionv1.ValidationAction{admissionv1.Deny},
+			MatchResources: &admissionv1.MatchResources{
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{corev1.LabelMetadataName: f.ns},
+				},
+			},
+		},
+	}
+	Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+	Expect(k8sClient.Create(ctx, binding)).To(Succeed())
+	DeferCleanup(func() {
+		Expect(k8sClient.Delete(ctx, binding)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, policy)).To(Succeed())
+	})
+	Eventually(func() bool {
+		dep := getDeployment(f)
+		dep.Spec.Replicas = ptr.To(*dep.Spec.Replicas + 1)
+		return apierrors.IsInvalid(k8sClient.Update(ctx, dep, client.DryRunAll))
+	}).Should(BeTrue(), "the API server should enforce the policy before the test relies on it")
 }
 
 func getDeployment(f *fixture) *appsv1.Deployment {
@@ -372,6 +423,28 @@ var _ = Describe("Understudy controller", func() {
 
 		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseRelaxed))
 		Eventually(func() error { return evict(f.pod, false) }).Should(Succeed())
+	})
+
+	It("fires the never-wedge TTL even when the surge itself is refused", func() {
+		f := newFixture(func(cr *appsv1alpha1.Understudy) {
+			cr.Spec.ReadinessDeadlineSeconds = ptr.To(int32(3))
+		})
+		freezeReplicas(f)
+		cordonNode(f.node)
+
+		By("recording the hold while the surge is refused")
+		Eventually(func() string {
+			if cond := findCond(getCR(f), appsv1alpha1.ConditionSurgeReady); cond != nil {
+				return cond.Reason
+			}
+			return ""
+		}).Should(Equal("SurgeFailed"))
+		Expect(getCR(f).Status.BlockedSince).NotTo(BeNil())
+
+		By("relaxing at the readiness deadline and admitting the eviction")
+		Eventually(func() appsv1alpha1.Phase { return getCR(f).Status.Phase }).Should(Equal(appsv1alpha1.PhaseRelaxed))
+		Eventually(func() error { return evict(f.pod, false) }).Should(Succeed())
+		Expect(*getDeployment(f).Spec.Replicas).To(Equal(int32(1)))
 	})
 
 	It("releases immediately when an involuntary deadline is shorter than minSurgeTimeSeconds", func() {
