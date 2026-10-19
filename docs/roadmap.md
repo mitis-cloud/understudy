@@ -1,5 +1,13 @@
 # Roadmap
 
+## v0.4.5 - Handover reliability
+
+Stand-ins honour `minReadySeconds`, failed surges retain the bounded eviction
+hold, and every operator replica watches node signals for webhook decisions.
+The sentinel chart arguments are corrected and checked against the binaries in
+CI. Dependency updates address identified x/net, gRPC, and OpenTelemetry
+advisories.
+
 ## v0.4.4 - GitOps baseline capacity
 
 `spec.baselineReplicas` lets Git supply the desired baseline while Understudy
