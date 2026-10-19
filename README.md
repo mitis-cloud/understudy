@@ -296,9 +296,10 @@ The operator refuses to manage itself, skips targets it cannot help, and stands
 down while a rollout is in progress.
 
 For production, use `replicaCount: 2` and place the replicas on different
-nodes. The webhook serves from every replica even though reconciliation is
-leader-gated. If the node hosting the only operator pod is drained, its own
-eviction is admitted and protection for pods later in that drain can disappear.
+nodes. Every replica watches node signals and serves the webhook even though
+reconciliation is leader-gated. If the node hosting the only operator pod is
+drained, its own eviction is admitted and protection for pods later in that
+drain can disappear.
 
 ## Limits
 

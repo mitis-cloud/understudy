@@ -21,8 +21,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -46,6 +48,8 @@ func (a *Adapter) SetupWithManager(mgr ctrl.Manager, reg *signal.Registry) error
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Node{}).
 		Named("signal-cordon").
+		// Every replica serves the webhook from its own registry, and this only writes to it.
+		WithOptions(controller.Options{NeedLeaderElection: ptr.To(false)}).
 		WithEventFilter(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool { return true },
 			DeleteFunc: func(e event.DeleteEvent) bool { return true },

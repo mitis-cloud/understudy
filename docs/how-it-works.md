@@ -160,7 +160,8 @@ holds immediately.
 
 An operator restart therefore creates a protection gap rather than a stuck
 cluster. Run two replicas on different nodes for production. Reconciliation
-uses leader election, but every replica serves webhook traffic.
+uses leader election, but every replica watches node signals and serves
+webhook traffic.
 
 The upgrade from 0.3.x runs a leader-gated startup sweep that deletes legacy
 PodDisruptionBudgets labeled `understudy.sh/owned=true`. PDB read/delete RBAC
