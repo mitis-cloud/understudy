@@ -112,6 +112,10 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 chart-check: ## Verify the chart's Artifact Hub metadata tracks appVersion
 	./hack/check-chart-metadata.sh
 
+.PHONY: chart-args-check
+chart-args-check: ## Verify every binary accepts the args the chart passes it
+	./hack/check-chart-args.sh
+
 .PHONY: release
 release: ## Push the multi-arch image and the chart for VERSION, from a tagged clean tree.
 	./hack/release.sh $(VERSION)

@@ -65,7 +65,6 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/sentinel"]
           args:
-            - --mode=sentinel
             - --cloud={{ .Values.sentinel.cloud }}
             - --surge-on-rebalance={{ .Values.sentinel.surgeOnRebalance }}
           env:
