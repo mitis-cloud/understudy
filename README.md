@@ -18,11 +18,6 @@
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/kylan11/understudy?style=for-the-badge"></a>
     <a href="https://github.com/kylan11/understudy/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/kylan11/understudy?style=for-the-badge&color=e3b341"></a>
   </p>
-  <p>
-    <a href="https://faun.dev/toolbox/understudy/"><img alt="FAUN.dev score: 74/100" src="https://faun.dev/toolbox/understudy/badge.svg?kind=score"></a>
-    <a href="https://faun.dev/toolbox/understudy/"><img alt="Code: Open source" src="https://faun.dev/toolbox/understudy/badge.svg?kind=code"></a>
-    <a href="https://faun.dev/toolbox/understudy/"><img alt="License: Apache-2.0" src="https://faun.dev/toolbox/understudy/badge.svg?kind=license"></a>
-  </p>
   <img src="docs/assets/terminal-demo.svg" width="720" alt="Terminal simulation: the pod in production receives a spot interruption notice, Understudy holds the eviction and starts a stand-in pod that goes from Pending to Running; only then does the original terminate. The probe records 764 requests, 1 failed.">
 </div>
 
