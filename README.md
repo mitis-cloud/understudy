@@ -328,7 +328,18 @@ including single-replica StatefulSets, and always will be.
 make test    # envtest suite, including the upstream Argo Rollout CRD
 make lint
 make build
+
 ```
+## Star History
+Thanks to everyone using Understudy, reporting bugs, requesting features, testing builds, and contributing fixes.
+
+<a href="https://www.star-history.com/?repos=mitis-cloud%2Funderstudy&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=mitis-cloud/understudy&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=mitis-cloud/understudy&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=mitis-cloud/understudy&type=date&legend=top-left" />
+ </picture>
+</a>
 
 ## License
 
